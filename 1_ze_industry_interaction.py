@@ -310,6 +310,87 @@ def train_stage2_models(horizon_data, horizon=6, n_cv_splits=5, val_size=12):
 
 
 # ==============================================================================
+# STEP 3b: TRAIN LIGHTGBM PER HORIZON
+# ==============================================================================
+
+def train_stage2_models_lgb(horizon_data, horizon=6, n_cv_splits=5, val_size=12):
+    """
+    LightGBM per horizon. Gradient boosting with early stopping.
+    Hyperparameters inherited from Stage 1 LightGBM settings.
+    
+    Output: dict {h: {'model', 'scaler', 'val_mae', 'coefs'}}
+    """
+    models = {}
+    scaler = StandardScaler()
+    scaler.fit(horizon_data[1]['X'])   # fit once on h=1 features
+    
+    # LightGBM hyperparameters (consistent with Stage 1)
+    LGB_PARAMS = {
+        'objective': 'regression',
+        'metric': 'mae',
+        'boosting_type': 'gbdt',
+        'num_leaves': 31,
+        'learning_rate': 0.05,
+        'n_estimators': 200,
+        'subsample': 0.8,
+        'colsample_bytree': 0.8,
+        'reg_alpha': 0.1,
+        'reg_lambda': 0.1,
+        'random_state': 42,
+        'verbose': -1,
+    }
+    
+    for h in range(1, horizon + 1):
+        X     = horizon_data[h]['X']
+        Y     = horizon_data[h]['Y']
+        n     = len(Y)
+        
+        val_mask   = pd.Series(range(n)) >= (n - val_size)
+        train_mask = ~val_mask
+        
+        X_sc     = scaler.transform(X)
+        X_train  = X_sc[train_mask];  Y_train = Y.values[train_mask]
+        X_val    = X_sc[val_mask];    Y_val   = Y.values[val_mask]
+        
+        # LightGBM dataset
+        train_set = lgb.Dataset(X_train, label=Y_train)
+        val_set   = lgb.Dataset(X_val, label=Y_val, reference=train_set)
+        
+        model = lgb.train(
+            LGB_PARAMS,
+            train_set,
+            valid_sets=[val_set],
+            valid_names=['val'],
+            callbacks=[
+                lgb.early_stopping(stopping_rounds=20, verbose=False),
+                lgb.log_evaluation(period=0)
+            ]
+        )
+        
+        val_preds = model.predict(X_val)
+        val_mae   = mean_absolute_error(Y_val, val_preds)
+        val_mape  = np.mean(np.abs((Y_val - val_preds) / (np.abs(Y_val) + 1e-8))) * 100
+        
+        # Feature importances (gain)
+        importances = pd.Series(
+            model.feature_importance(importance_type='gain'),
+            index=X.columns
+        ).sort_values(ascending=False)
+        
+        print(f"  [INFO] h={h} | LGB val_MAE={val_mae:.4f} | MAPE={val_mape:.2f}% | "
+              f"top feature={importances.index[0] if len(importances) > 0 else 'none'}")
+        
+        models[h] = {
+            'model': model,
+            'scaler': scaler,
+            'val_mae': val_mae,
+            'coefs': importances,  # store feature importances for compatibility
+        }
+    
+    return models
+
+
+# ==============================================================================
 # STEP 4: INFERENCE
 # ==============================================================================
 
@@ -363,6 +444,19 @@ def predict_stage2(models, X_hat_spatial, Y, climate_future=None,
         forecasts.append({'horizon': h, 'point_forecast': point})
 
     return pd.DataFrame(forecasts).set_index('horizon')
+
+
+# ==============================================================================
+# STEP 4b: LIGHTGBM INFERENCE
+# ==============================================================================
+
+def predict_stage2_lgb(models, X_hat_spatial, Y, climate_future=None,
+                       holidays_future=None, y_lags=[1,2,3,6,12], horizon=6):
+    """
+    LightGBM variant of Stage 2 inference. Uses the same logic as predict_stage2.
+    """
+    return predict_stage2(models, X_hat_spatial, Y, climate_future,
+                          holidays_future, y_lags, horizon)
 
 
 # ==============================================================================
@@ -451,7 +545,10 @@ def walk_forward_validate_stage2(Y, hist_spatial, panel, pca, scaler_pca,
     All models re-fit on training slice only. No future data leakage.
     Reports MAE, RMSE, MAPE per horizon + skill score vs Naïve.
     """
-    from stage1 import predict_residual_chain, engineer_spatial_features
+    import importlib
+    stage1 = importlib.import_module('0_ze_forecast_monthly')
+    predict_residual_chain = stage1.predict_residual_chain
+    engineer_spatial_features = stage1.engineer_spatial_features
 
     results = []
     n       = len(Y)
@@ -466,7 +563,7 @@ def walk_forward_validate_stage2(Y, hist_spatial, panel, pca, scaler_pca,
 
         print(f"\n  [FOLD {fold}] train={t} months")
 
-        # -- Two-Stage Transfer --
+        # -- Two-Stage Transfer (ElasticNet) --
         try:
             hdata    = build_stage2_training_matrix(Y_train, S_train,
                                                      climate_hist, holidays_hist,
@@ -477,8 +574,22 @@ def walk_forward_validate_stage2(Y, hist_spatial, panel, pca, scaler_pca,
             fc_ts    = predict_stage2(s2_mods, X_hat_s, Y_train, horizon=horizon)
             preds_ts = fc_ts['point_forecast'].values
         except Exception as e:
-            print(f"  [WARN] Two-Stage: {e}")
+            print(f"  [WARN] Two-Stage (ElasticNet): {e}")
             preds_ts = np.full(horizon, Y_train.iloc[-1])
+
+        # -- Two-Stage Transfer (LightGBM) --
+        try:
+            hdata_lgb = build_stage2_training_matrix(Y_train, S_train,
+                                                      climate_hist, holidays_hist,
+                                                      horizon=horizon)
+            s2_mods_lgb = train_stage2_models_lgb(hdata_lgb, horizon, n_cv_splits)
+            X_hat_m     = predict_residual_chain(stage1_models, P_train, le, city_stats, horizon)
+            X_hat_s, _, _ = engineer_spatial_features(X_hat_m, P_train, pca.n_components_)
+            fc_lgb      = predict_stage2_lgb(s2_mods_lgb, X_hat_s, Y_train, horizon=horizon)
+            preds_lgb   = fc_lgb['point_forecast'].values
+        except Exception as e:
+            print(f"  [WARN] Two-Stage (LightGBM): {e}")
+            preds_lgb = np.full(horizon, Y_train.iloc[-1])
 
         # -- SARIMA --
         try:
@@ -492,6 +603,7 @@ def walk_forward_validate_stage2(Y, hist_spatial, panel, pca, scaler_pca,
 
         # -- Score --
         for model_name, preds in [('two_stage', preds_ts),
+                                   ('two_stage_lgb', preds_lgb),
                                    ('sarima',    preds_sarima),
                                    ('naive',     preds_naive)]:
             for h in range(horizon):
@@ -513,7 +625,7 @@ def walk_forward_validate_stage2(Y, hist_spatial, panel, pca, scaler_pca,
 
     # Skill score vs Naive
     naive_mae = df[df['model'] == 'naive'].groupby('horizon')['mae'].mean()
-    for m in ['two_stage', 'sarima']:
+    for m in ['two_stage', 'two_stage_lgb', 'sarima']:
         m_mae = df[df['model'] == m].groupby('horizon')['mae'].mean()
         skill = (1 - m_mae / naive_mae).round(4)
         print(f"\n  Skill score vs Naive [{m}] (>0 beats naive):")
@@ -528,7 +640,7 @@ def walk_forward_validate_stage2(Y, hist_spatial, panel, pca, scaler_pca,
 
 def plot_forecast(Y, forecast_df, benchmark_sarima, benchmark_naive,
                   title="Two-Stage Transfer Forecast",
-                  save_path='/mnt/user-data/outputs/forecast_plot.png',
+                  save_path='C:/Users/Dell/data_science/shap_explainer/forecast_plot.png',
                   n_history=24):
     fig, ax = plt.subplots(figsize=(12, 5))
     Y_plot  = Y.iloc[-n_history:]
@@ -575,13 +687,13 @@ def plot_forecast(Y, forecast_df, benchmark_sarima, benchmark_naive,
 def run_stage2(Y_monthly, stage1_artifacts, climate_hist=None, holidays_hist=None,
                climate_future=None, holidays_future=None,
                horizon=6, validate=True, plot=True,
-               plot_path='/mnt/user-data/outputs/forecast_plot.png'):
+               plot_path='C:/Users/Dell/data_science/shap_explainer/forecast_plot.png'):
     """
     Full Stage 2. Inputs: Y_monthly + stage1_artifacts from run_stage1().
     Returns dict with forecast, intervals, benchmarks, validation results.
     """
     print("=" * 60)
-    print("STAGE 2: ELASTICNET BRIDGE EQUATION")
+    print("STAGE 2: DUAL-MODEL BRIDGE EQUATION (ElasticNet + LightGBM)")
     print("=" * 60)
 
     X_hat_spatial = stage1_artifacts['X_hat_spatial']
@@ -591,9 +703,17 @@ def run_stage2(Y_monthly, stage1_artifacts, climate_hist=None, holidays_hist=Non
     stage1_models = stage1_artifacts['models']
     le            = stage1_artifacts['le']
     city_stats    = stage1_artifacts['city_stats']
+    X_hat_monthly = stage1_artifacts['X_hat_monthly']
+    # Compute city aggregates for the forecast horizons (same as historical)
+    city_agg = compute_city_aggregates(X_hat_monthly)
+    city_agg.index.name = 'horizon'  # align index name
+    X_hat_spatial = X_hat_spatial.join(city_agg, how='left')
 
     print("\n[1/6] Building historical spatial features...")
     hist_spatial = build_historical_spatial_features(panel, pca, scaler_pca)
+
+    # Ensure X_hat_spatial has same columns as hist_spatial (training data)
+    X_hat_spatial = X_hat_spatial.reindex(columns=hist_spatial.columns, fill_value=0)
 
     print("\n[2/6] Building Stage 2 training matrix...")
     global horizon_data
@@ -602,15 +722,29 @@ def run_stage2(Y_monthly, stage1_artifacts, climate_hist=None, holidays_hist=Non
 
     print("\n[3/6] Training ElasticNet per horizon...")
     s2_models = train_stage2_models(horizon_data, horizon)
+    
+    print("\n[3b/6] Training LightGBM per horizon...")
+    s2_models_lgb = train_stage2_models_lgb(horizon_data, horizon)
 
-    print("\n[4/6] Point forecast via Stage 2...")
+    print("\n[4/6] Point forecast via ElasticNet...")
     forecast_df = predict_stage2(
         s2_models, X_hat_spatial, Y_monthly,
         climate_future, holidays_future, horizon=horizon)
+    
+    print("\n[4b/6] Point forecast via LightGBM...")
+    forecast_df_lgb = predict_stage2_lgb(
+        s2_models_lgb, X_hat_spatial, Y_monthly,
+        climate_future, holidays_future, horizon=horizon)
 
-    print("\n[5/6] Bootstrap prediction intervals...")
+    print("\n[5/6] Bootstrap prediction intervals (ElasticNet)...")
     intervals_df = bootstrap_prediction_intervals(
         s2_models, X_hat_spatial, Y_monthly,
+        climate_future, holidays_future,
+        n_bootstrap=200, horizon=horizon)
+    
+    print("\n[5b/6] Bootstrap prediction intervals (LightGBM)...")
+    intervals_df_lgb = bootstrap_prediction_intervals(
+        s2_models_lgb, X_hat_spatial, Y_monthly,
         climate_future, holidays_future,
         n_bootstrap=200, horizon=horizon)
 
@@ -618,15 +752,21 @@ def run_stage2(Y_monthly, stage1_artifacts, climate_hist=None, holidays_hist=Non
     for col in ['lower_80', 'upper_80', 'lower_95', 'upper_95']:
         if col in intervals_df.columns:
             forecast_df[col] = intervals_df[col]
+    
+    # Merge intervals into forecast_df_lgb
+    for col in ['lower_80', 'upper_80', 'lower_95', 'upper_95']:
+        if col in intervals_df_lgb.columns:
+            forecast_df_lgb[col] = intervals_df_lgb[col]
 
     print("\n[5b/6] Benchmarks...")
     bm_sarima = fit_sarima_benchmark(Y_monthly, horizon)
     bm_naive  = fit_naive_benchmark(Y_monthly, horizon)
 
     comparison = pd.DataFrame({
-        'Two_Stage': forecast_df['point_forecast'],
-        'SARIMA':    bm_sarima['point_forecast'],
-        'Naive':     bm_naive['point_forecast'],
+        'Two_Stage_ElasticNet': forecast_df['point_forecast'],
+        'Two_Stage_LightGBM':   forecast_df_lgb['point_forecast'],
+        'SARIMA':               bm_sarima['point_forecast'],
+        'Naive':                bm_naive['point_forecast'],
     })
     print("\n  ===== FORECAST COMPARISON =====")
     print(comparison.round(4).to_string())
@@ -647,8 +787,13 @@ def run_stage2(Y_monthly, stage1_artifacts, climate_hist=None, holidays_hist=Non
 
     feat_importance = {h: s2_models[h]['coefs'][s2_models[h]['coefs'] != 0].head(10)
                        for h in range(1, horizon + 1)}
-    print("\n  ===== TOP FEATURES h=1 =====")
+    print("\n  ===== TOP FEATURES (ElasticNet) h=1 =====")
     print(feat_importance[1].round(4).to_string())
+    
+    feat_importance_lgb = {h: s2_models_lgb[h]['coefs'][s2_models_lgb[h]['coefs'] != 0].head(10)
+                           for h in range(1, horizon + 1)}
+    print("\n  ===== TOP FEATURES (LightGBM) h=1 =====")
+    print(feat_importance_lgb[1].round(4).to_string())
 
     print("\n" + "=" * 60)
     print("STAGE 2 COMPLETE")
@@ -664,6 +809,10 @@ def run_stage2(Y_monthly, stage1_artifacts, climate_hist=None, holidays_hist=Non
         'val_results':        val_results,
         'comparison':         comparison,
         'feature_importance': feat_importance,
+        'models_lgb':         s2_models_lgb,
+        'forecast_lgb':       forecast_df_lgb,
+        'intervals_lgb':      intervals_df_lgb,
+        'feature_importance_lgb': feat_importance_lgb,
     }
 
 
@@ -672,7 +821,9 @@ def run_stage2(Y_monthly, stage1_artifacts, climate_hist=None, holidays_hist=Non
 # ==============================================================================
 
 if __name__ == '__main__':
-    from stage1 import run_stage1
+    import importlib
+    stage1 = importlib.import_module('0_ze_forecast_monthly')
+    run_stage1 = stage1.run_stage1
 
     print("Generating synthetic data...")
     np.random.seed(42)
